@@ -1,4 +1,4 @@
-name: "CodeQL Advanced (Optimized, Multi-Lang)"
+name: "CodeQL Advanced (Optimized, Multi-Lang, Stable)"
 
 on:
   workflow_dispatch:
@@ -16,73 +16,78 @@ permissions:
   packages: read
 
 jobs:
-  codeql-optimized:
-    name: "CodeQL Optimized"
+  detect:
+    name: Detect languages
     runs-on: ubuntu-latest
-
+    outputs:
+      langs_csv: ${{ steps.out.outputs.langs_csv }}
+      langs_json: ${{ steps.out.outputs.langs_json }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
 
-      # Detect languages supported by CodeQL (Ubuntu runner).
-      - name: Detect languages
-        id: detect
+      - id: scan
         shell: bash
         run: |
           langs=()
 
           # Java/Kotlin
-          if git ls-files '*.java' '*.kt' '*.kts' | grep -q .; then
-            langs+=("java")
-          fi
+          if git ls-files '*.java' '*.kt' '*.kts' | grep -q .; then langs+=("java"); fi
 
           # JavaScript / TypeScript
-          if git ls-files '*.js' '*.jsx' '*.ts' '*.tsx' | grep -q .; then
-            langs+=("javascript")
-          fi
+          if git ls-files '*.js' '*.jsx' '*.ts' '*.tsx' | grep -q .; then langs+=("javascript"); fi
 
           # Python
-          if git ls-files '*.py' | grep -q .; then
-            langs+=("python")
-          fi
+          if git ls-files '*.py' | grep -q .; then langs+=("python"); fi
 
           # Go
-          if git ls-files '*.go' | grep -q .; then
-            langs+=("go")
-          fi
+          if git ls-files '*.go' | grep -q .; then langs+=("go"); fi
 
           # Ruby
-          if git ls-files '*.rb' | grep -q .; then
-            langs+=("ruby")
-          fi
+          if git ls-files '*.rb' | grep -q .; then langs+=("ruby"); fi
 
-          # C / C++
-          if git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hpp' | grep -q .; then
-            langs+=("cpp")
-          fi
-
-          # NOTE: C# needs windows-latest, Swift needs macos-latest; skipped here.
+          # C / C++ (analyze without autobuild to avoid failures)
+          if git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hpp' | grep -q .; then langs+=("cpp"); fi
 
           if [ ${#langs[@]} -eq 0 ]; then
-            echo "languages=" >> "$GITHUB_OUTPUT"
-            echo "No CodeQL-supported languages detected on ubuntu-latest."
+            echo "No supported languages detected."
+            echo "langs_csv=" >> "$GITHUB_OUTPUT"
+            echo 'langs_json=[]' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          IFS=','; echo "languages=${langs[*]}" >> "$GITHUB_OUTPUT"
-          echo "Detected languages: ${langs[*]}"
+          csv="$(IFS=,; echo "${langs[*]}")"
+          json="$(printf '[%s]' "$(printf '"%s",' "${langs[@]}" | sed 's/,$//')")"
+
+          echo "Detected: $csv"
+          echo "langs_csv=$csv" >> "$GITHUB_OUTPUT"
+          echo "langs_json=$json" >> "$GITHUB_OUTPUT"
+
+      - id: out
+        run: echo "langs_csv=${{ steps.scan.outputs.langs_csv }}"; echo "langs_json=${{ steps.scan.outputs.langs_json }}"
+
+  analyze:
+    name: CodeQL Optimized • ${{ matrix.language }}
+    needs: detect
+    if: ${{ needs.detect.outputs.langs_json != '[]' && needs.detect.outputs.langs_json != '' }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJson(needs.detect.outputs.langs_json) }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
 
       - name: Setup Node (for JS/TS)
-        if: ${{ contains(steps.detect.outputs.languages, 'javascript') }}
+        if: ${{ matrix.language == 'javascript' }}
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # Create an org/repo-level CodeQL config on the fly (you can commit this later if you like)
-      - name: Write CodeQL config
-        if: ${{ steps.detect.outputs.languages != '' }}
+      - name: Write CodeQL config (optimized)
         shell: bash
         run: |
           mkdir -p .github/codeql-config
@@ -107,30 +112,35 @@ jobs:
             - uses: security-extended
             - uses: security-and-quality
           YAML
-          echo "Wrote .github/codeql-config/codeql-config.yml"
+          echo "Wrote CodeQL config."
 
-      - name: Initialize CodeQL (optimized)
-        if: ${{ steps.detect.outputs.languages != '' }}
+      - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
-          languages: ${{ steps.detect.outputs.languages }}
+          languages: ${{ matrix.language }}
           config-file: ./.github/codeql-config/codeql-config.yml
           ram: 8192
           threads: 0
 
-      # Autobuild for compiled languages (no-op if none)
-      - name: Autobuild (compiled languages)
-        if: ${{ steps.detect.outputs.languages != '' && (contains(steps.detect.outputs.languages, 'java') || contains(steps.detect.outputs.languages, 'cpp')) }}
+      # Only autobuild Java when a build file exists; NEVER autobuild C/C++ here
+      - name: Autobuild (Java when build files present)
+        if: ${{ matrix.language == 'java' && (hashFiles('**/pom.xml') != '' || hashFiles('**/build.gradle*') != '') }}
         uses: github/codeql-action/autobuild@v4
 
-      - name: Analyze (optimized)
-        if: ${{ steps.detect.outputs.languages != '' }}
+      - name: Skip autobuild (no build metadata or non-compiled lang)
+        if: ${{ !(matrix.language == 'java' && (hashFiles('**/pom.xml') != '' || hashFiles('**/build.gradle*') != '')) }}
+        run: echo "Autobuild skipped for ${{ matrix.language }}."
+
+      - name: Analyze (${{ matrix.language }})
         uses: github/codeql-action/analyze@v4
         with:
-          category: "/optimized"
+          category: "/language:${{ matrix.language }}/optimized"
         timeout-minutes: 60
 
-      - name: No supported languages found
-        if: ${{ steps.detect.outputs.languages == '' }}
-        run: |
-          echo "No compatible languages found to scan on ubuntu-latest. Skipping." >> "$GITHUB_STEP_SUMMARY"
+  no-langs:
+    name: No supported languages
+    needs: detect
+    if: ${{ needs.detect.outputs.langs_json == '[]' || needs.detect.outputs.langs_json == '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "No CodeQL-supported languages found on ubuntu-latest." >> "$GITHUB_STEP_SUMMARY"
