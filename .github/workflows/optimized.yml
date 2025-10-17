@@ -20,56 +20,61 @@ jobs:
     name: Detect languages
     runs-on: ubuntu-latest
     outputs:
-      langs_csv: ${{ steps.out.outputs.langs_csv }}
-      langs_json: ${{ steps.out.outputs.langs_json }}
+      langs_json: ${{ steps.scan.outputs.langs_json }}
+      langs_csv:  ${{ steps.scan.outputs.langs_csv }}
+      cs_found:   ${{ steps.scan.outputs.cs_found }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+
+      - name: Debug file listing
+        run: |
+          echo "=== git ls-files (head) ==="
+          git ls-files | head -n 50 || true
+          echo "=== repo tree (top-level) ==="
+          ls -la || true
 
       - id: scan
         shell: bash
         run: |
           langs=()
+          cs_found="false"
 
           # Java/Kotlin
           if git ls-files '*.java' '*.kt' '*.kts' | grep -q .; then langs+=("java"); fi
-
           # JavaScript / TypeScript
           if git ls-files '*.js' '*.jsx' '*.ts' '*.tsx' | grep -q .; then langs+=("javascript"); fi
-
           # Python
           if git ls-files '*.py' | grep -q .; then langs+=("python"); fi
-
           # Go
           if git ls-files '*.go' | grep -q .; then langs+=("go"); fi
-
           # Ruby
           if git ls-files '*.rb' | grep -q .; then langs+=("ruby"); fi
-
-          # C / C++ (analyze without autobuild to avoid failures)
+          # C / C++  (analyze w/o autobuild)
           if git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hpp' | grep -q .; then langs+=("cpp"); fi
+          # C# (handled in a separate Windows job)
+          if git ls-files '*.cs' | grep -q .; then cs_found="true"; fi
 
           if [ ${#langs[@]} -eq 0 ]; then
-            echo "No supported languages detected."
+            echo "No linux-scannable languages detected."
             echo "langs_csv=" >> "$GITHUB_OUTPUT"
             echo 'langs_json=[]' >> "$GITHUB_OUTPUT"
+            echo "cs_found=$cs_found" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           csv="$(IFS=,; echo "${langs[*]}")"
           json="$(printf '[%s]' "$(printf '"%s",' "${langs[@]}" | sed 's/,$//')")"
 
-          echo "Detected: $csv"
-          echo "langs_csv=$csv" >> "$GITHUB_OUTPUT"
+          echo "Detected languages (linux): $csv  |  C# present: $cs_found"
+          echo "langs_csv=$csv"   >> "$GITHUB_OUTPUT"
           echo "langs_json=$json" >> "$GITHUB_OUTPUT"
-
-      - id: out
-        run: echo "langs_csv=${{ steps.scan.outputs.langs_csv }}"; echo "langs_json=${{ steps.scan.outputs.langs_json }}"
+          echo "cs_found=$cs_found" >> "$GITHUB_OUTPUT"
 
   analyze:
     name: CodeQL Optimized • ${{ matrix.language }}
     needs: detect
-    if: ${{ needs.detect.outputs.langs_json != '[]' && needs.detect.outputs.langs_json != '' }}
+    if: ${{ needs.detect.outputs.langs_json != '' && needs.detect.outputs.langs_json != '[]' }}
     runs-on: ubuntu-latest
 
     strategy:
@@ -112,7 +117,6 @@ jobs:
             - uses: security-extended
             - uses: security-and-quality
           YAML
-          echo "Wrote CodeQL config."
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
@@ -122,12 +126,12 @@ jobs:
           ram: 8192
           threads: 0
 
-      # Only autobuild Java when a build file exists; NEVER autobuild C/C++ here
+      # Autobuild Java ONLY when a build file is present; never autobuild C/C++
       - name: Autobuild (Java when build files present)
         if: ${{ matrix.language == 'java' && (hashFiles('**/pom.xml') != '' || hashFiles('**/build.gradle*') != '') }}
         uses: github/codeql-action/autobuild@v4
 
-      - name: Skip autobuild (no build metadata or non-compiled lang)
+      - name: Skip autobuild
         if: ${{ !(matrix.language == 'java' && (hashFiles('**/pom.xml') != '' || hashFiles('**/build.gradle*') != '')) }}
         run: echo "Autobuild skipped for ${{ matrix.language }}."
 
@@ -137,10 +141,48 @@ jobs:
           category: "/language:${{ matrix.language }}/optimized"
         timeout-minutes: 60
 
-  no-langs:
-    name: No supported languages
+  analyze-csharp:
+    name: CodeQL Optimized • csharp (Windows)
     needs: detect
-    if: ${{ needs.detect.outputs.langs_json == '[]' || needs.detect.outputs.langs_json == '' }}
-    runs-on: ubuntu-latest
+    if: ${{ needs.detect.outputs.cs_found == 'true' }}
+    runs-on: windows-latest
     steps:
-      - run: echo "No CodeQL-supported languages found on ubuntu-latest." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Write CodeQL config (optimized)
+        shell: bash
+        run: |
+          mkdir -p .github/codeql-config
+          cat > .github/codeql-config/codeql-config.yml <<'YAML'
+          name: org-optimized
+          paths-ignore:
+            - "**/test/**"
+            - "**/__tests__/**"
+            - "**/spec/**"
+            - "**/bin/**"
+            - "**/obj/**"
+            - "**/dist/**"
+            - "**/coverage/**"
+            - "**/generated/**"
+          queries:
+            - uses: security-extended
+            - uses: security-and-quality
+          YAML
+
+      - name: Initialize CodeQL (csharp)
+        uses: github/codeql-action/init@v4
+        with:
+          languages: csharp
+          config-file: ./.github/codeql-config/codeql-config.yml
+          ram: 8192
+          threads: 0
+
+      - name: Autobuild (csharp)
+        uses: github/codeql-action/autobuild@v4
+
+      - name: Analyze (csharp)
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:csharp/optimized"
+        timeout-minutes: 60
