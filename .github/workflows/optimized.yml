@@ -1,0 +1,136 @@
+name: "CodeQL Advanced (Optimized, Multi-Lang)"
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ "main" ]
+  push:
+    branches: [ "main" ]
+  schedule:
+    - cron: "31 19 * * 0"
+
+permissions:
+  security-events: write
+  contents: read
+  actions: read
+  packages: read
+
+jobs:
+  codeql-optimized:
+    name: "CodeQL Optimized"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Detect languages supported by CodeQL (Ubuntu runner).
+      - name: Detect languages
+        id: detect
+        shell: bash
+        run: |
+          langs=()
+
+          # Java/Kotlin
+          if git ls-files '*.java' '*.kt' '*.kts' | grep -q .; then
+            langs+=("java")
+          fi
+
+          # JavaScript / TypeScript
+          if git ls-files '*.js' '*.jsx' '*.ts' '*.tsx' | grep -q .; then
+            langs+=("javascript")
+          fi
+
+          # Python
+          if git ls-files '*.py' | grep -q .; then
+            langs+=("python")
+          fi
+
+          # Go
+          if git ls-files '*.go' | grep -q .; then
+            langs+=("go")
+          fi
+
+          # Ruby
+          if git ls-files '*.rb' | grep -q .; then
+            langs+=("ruby")
+          fi
+
+          # C / C++
+          if git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hpp' | grep -q .; then
+            langs+=("cpp")
+          fi
+
+          # NOTE: C# needs windows-latest, Swift needs macos-latest; skipped here.
+
+          if [ ${#langs[@]} -eq 0 ]; then
+            echo "languages=" >> "$GITHUB_OUTPUT"
+            echo "No CodeQL-supported languages detected on ubuntu-latest."
+            exit 0
+          fi
+
+          IFS=','; echo "languages=${langs[*]}" >> "$GITHUB_OUTPUT"
+          echo "Detected languages: ${langs[*]}"
+
+      - name: Setup Node (for JS/TS)
+        if: ${{ contains(steps.detect.outputs.languages, 'javascript') }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Create an org/repo-level CodeQL config on the fly (you can commit this later if you like)
+      - name: Write CodeQL config
+        if: ${{ steps.detect.outputs.languages != '' }}
+        shell: bash
+        run: |
+          mkdir -p .github/codeql-config
+          cat > .github/codeql-config/codeql-config.yml <<'YAML'
+          name: org-optimized
+          paths-ignore:
+            - "**/test/**"
+            - "**/__tests__/**"
+            - "**/spec/**"
+            - "**/jest/**"
+            - "**/target/**"
+            - "**/build/**"
+            - "**/dist/**"
+            - "**/coverage/**"
+            - "**/node_modules/**"
+            - "**/vendor/**"
+            - "**/.venv/**"
+            - "**/.tox/**"
+            - "**/*.min.js"
+            - "**/generated/**"
+          queries:
+            - uses: security-extended
+            - uses: security-and-quality
+          YAML
+          echo "Wrote .github/codeql-config/codeql-config.yml"
+
+      - name: Initialize CodeQL (optimized)
+        if: ${{ steps.detect.outputs.languages != '' }}
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ steps.detect.outputs.languages }}
+          config-file: ./.github/codeql-config/codeql-config.yml
+          ram: 8192
+          threads: 0
+
+      # Autobuild for compiled languages (no-op if none)
+      - name: Autobuild (compiled languages)
+        if: ${{ steps.detect.outputs.languages != '' && (contains(steps.detect.outputs.languages, 'java') || contains(steps.detect.outputs.languages, 'cpp')) }}
+        uses: github/codeql-action/autobuild@v4
+
+      - name: Analyze (optimized)
+        if: ${{ steps.detect.outputs.languages != '' }}
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/optimized"
+        timeout-minutes: 60
+
+      - name: No supported languages found
+        if: ${{ steps.detect.outputs.languages == '' }}
+        run: |
+          echo "No compatible languages found to scan on ubuntu-latest. Skipping." >> "$GITHUB_STEP_SUMMARY"
